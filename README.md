@@ -55,8 +55,8 @@ flowchart LR
 | Milestone | Status |
 |---|---|
 | M0. Set up the workspace | ✅ Done |
-| M1. Data pipeline on Databricks (bronze, silver, gold) | 🟡 Bronze and silver done; gold features in progress |
-| M2. Train and compare models with MLflow | ⬜ Planned |
+| M1. Data pipeline on Databricks (bronze, silver, gold) | ✅ Done |
+| M2. Train and compare models with MLflow | ⬜ training the fraud model |
 | M3. Deploy and monitor on SageMaker | ⬜ Planned |
 | M4. CI/CD with GitHub Actions | ⬜ Planned |
 | M5. Fraud analyst agent on Bedrock | ⬜ Planned |
