@@ -113,7 +113,22 @@ def test_accepts_a_single_transaction_and_returns_json(model_dir):
     result = json.loads(body)["predictions"]
     assert content_type == "application/json"
     assert len(result) == 1
-    assert set(result[0]) == {"transaction_id", "fraud_score", "flagged", "threshold", "model_version"}
+    assert set(result[0]) == {"transaction_id", "fraud_score", "flagged", "threshold", "model_version", "top_reasons"}
+
+
+def test_top_reasons_are_the_largest_positive_shap_values(model_dir):
+    path, clf, d, X = model_dir
+    model = inference.model_fn(str(path))
+    predictions = inference.predict_fn(as_request_records(d), model)
+
+    contribs = clf.get_booster().predict(xgb.DMatrix(X), pred_contribs=True)[:, :-1]
+    for p, c in zip(predictions, contribs):
+        reasons = p["top_reasons"]
+        assert len(reasons) <= inference.TOP_REASONS
+        assert all(r["contribution"] > 0 for r in reasons)
+        assert [r["contribution"] for r in reasons] == sorted((r["contribution"] for r in reasons), reverse=True)
+        expected = [X.columns[i] for i in np.argsort(c)[::-1][: len(reasons)]]
+        assert [r["feature"] for r in reasons] == expected
 
 
 def test_rejects_non_json(model_dir):
