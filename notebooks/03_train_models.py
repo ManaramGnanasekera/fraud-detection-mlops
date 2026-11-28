@@ -5,8 +5,8 @@
 # MAGIC **Milestone M2.** This notebook is built in steps:
 # MAGIC
 # MAGIC 1. Load gold, split by time, rules baseline, MLflow ✅
-# MAGIC 2. **Logistic regression and XGBoost, cost-based threshold** ← this version
-# MAGIC 3. SHAP explanations, fairness check, register the champion model
+# MAGIC 2. Logistic regression and XGBoost, cost-based threshold ✅
+# MAGIC 3. **SHAP explanations, fairness check, register the champion model** ← this version
 # MAGIC
 # MAGIC **Run:** from the repo's Git folder, on serverless compute.
 
@@ -335,14 +335,14 @@ XGB_PARAMS = {
     "n_jobs": -1,
 }
 
-with mlflow.start_run(run_name="xgboost"):
+with mlflow.start_run(run_name="xgboost") as xgb_run:
     xgb = XGBClassifier(**XGB_PARAMS)
     xgb.fit(X_train, y_train)
     xgb_result = score_model("XGBoost", xgb)
 
     mlflow.log_params({"approach": "xgboost", "false_alarm_cost_usd": FALSE_ALARM_COST, **XGB_PARAMS})
     mlflow.log_metrics({f"test_{k}": v for k, v in xgb_result.items()})
-    mlflow.xgboost.log_model(xgb, artifact_path="model", input_example=X_train.head(5))
+    xgb_model_info = mlflow.xgboost.log_model(xgb, artifact_path="model", input_example=X_train.head(5))
 
 # COMMAND ----------
 
@@ -358,3 +358,146 @@ comparison = pd.DataFrame(
 columns = ["recall", "precision", "pr_auc", "threshold", "alerts", "frauds_caught",
            "false_alarms", "cost_usd", "saving_vs_no_model_usd"]
 display(comparison[columns].round(3).reset_index(names="approach"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Step 3 · Explain, check fairness, register
+# MAGIC
+# MAGIC ## 11. Why does XGBoost flag a transaction? (SHAP)
+# MAGIC
+# MAGIC **SHAP values** split each fraud score into contributions from each input: how much each feature pushed
+# MAGIC this transaction towards "fraud" or towards "genuine". XGBoost calculates them itself (`pred_contribs`).
+# MAGIC Averaging their size over many transactions shows which features the model relies on most.
+
+# COMMAND ----------
+
+import matplotlib.pyplot as plt
+from xgboost import DMatrix
+
+shap_sample = X_test.sample(n=min(50_000, len(X_test)), random_state=42)
+contribs = xgb.get_booster().predict(DMatrix(shap_sample), pred_contribs=True)
+shap_values = pd.DataFrame(contribs[:, :-1], columns=shap_sample.columns, index=shap_sample.index)  # last column is the bias
+
+importance = shap_values.abs().mean().sort_values(ascending=False)
+importance_table = importance.rename_axis("feature").rename("mean_abs_shap").reset_index()
+display(importance_table.round(4))
+
+top = importance.head(12)[::-1]
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.barh(top.index, top.values, color="#2b6cb0")
+ax.set_xlabel("Average impact on the fraud score (mean |SHAP|)")
+ax.set_title("What drives XGBoost's fraud scores")
+fig.tight_layout()
+display(fig)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### One flagged transaction, explained
+# MAGIC
+# MAGIC The highest-scoring real fraud in the test months, with the features that pushed its score up the most.
+# MAGIC Positive contributions push towards "fraud". This is what the analyst assistant in M5 will put into words.
+
+# COMMAND ----------
+
+xgb_test_scores = xgb.predict_proba(X_test)[:, 1]
+fraud_positions = np.where(y_test.to_numpy() == 1)[0]
+top_fraud_pos = fraud_positions[np.argmax(xgb_test_scores[fraud_positions])]
+example = X_test.iloc[[top_fraud_pos]]
+
+example_contribs = xgb.get_booster().predict(DMatrix(example), pred_contribs=True)[0, :-1]
+explanation = pd.DataFrame({
+    "feature": example.columns,
+    "value": example.iloc[0].to_numpy(),
+    "contribution": example_contribs,
+}).sort_values("contribution", ascending=False)
+
+print(f"Transaction {test['transaction_id'].iloc[top_fraud_pos]}: amount ${test['amount'].iloc[top_fraud_pos]:,.2f}, "
+      f"fraud score {xgb_test_scores[top_fraud_pos]:.3f}")
+display(explanation.head(6).round(3))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 12. Fairness check
+# MAGIC
+# MAGIC `gender` is not a model input, but `customer_age` is, and either can still be treated unevenly through
+# MAGIC other features, so both are checked. A fair fraud model
+# MAGIC should catch fraud equally well for every group (**recall**) and should not wrongly flag one group's honest
+# MAGIC customers much more often (**false alarm rate**: false alarms ÷ genuine transactions).
+
+# COMMAND ----------
+
+THRESHOLD = xgb_result["threshold"]
+
+fair = test[["is_fraud", "gender", "customer_age"]].copy()
+fair["flagged"] = (xgb_test_scores >= THRESHOLD).astype(int)
+fair["age_band"] = pd.cut(fair["customer_age"], bins=[0, 29, 44, 59, 200],
+                          labels=["under 30", "30-44", "45-59", "60+"])
+
+
+def group_report(frame, group_col):
+    rows = []
+    for group, g in frame.groupby(group_col, observed=True):
+        frauds = int(g["is_fraud"].sum())
+        genuine = int((g["is_fraud"] == 0).sum())
+        caught = int(((g["is_fraud"] == 1) & (g["flagged"] == 1)).sum())
+        false_alarms = int(((g["is_fraud"] == 0) & (g["flagged"] == 1)).sum())
+        rows.append({
+            group_col: str(group),
+            "transactions": len(g),
+            "frauds": frauds,
+            "recall": round(caught / frauds, 3) if frauds else None,
+            "false_alarm_rate_pct": round(100 * false_alarms / genuine, 3) if genuine else None,
+        })
+    return pd.DataFrame(rows)
+
+
+gender_report = group_report(fair, "gender")
+age_report = group_report(fair, "age_band")
+display(gender_report)
+display(age_report)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 13. Save the explanations to the XGBoost run
+
+# COMMAND ----------
+
+with mlflow.start_run(run_id=xgb_run.info.run_id):
+    mlflow.log_figure(fig, "shap_importance.png")
+    mlflow.log_table(importance_table, "shap_importance.json")
+    mlflow.log_table(gender_report, "fairness_by_gender.json")
+    mlflow.log_table(age_report, "fairness_by_age.json")
+    mlflow.log_metric("threshold", THRESHOLD)
+
+print("Saved SHAP importance and fairness tables to the xgboost run")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 14. Register XGBoost as the champion model
+# MAGIC
+# MAGIC The model is registered in **Unity Catalog** as `workspace.fraud.fraud_detector`, and this version gets the
+# MAGIC alias **`champion`**. Later steps (SageMaker deployment in M3) load "the champion", so promoting a better model
+# MAGIC in future only means moving the alias. The alert threshold is stored with the version, because the model's
+# MAGIC scores are only meaningful together with it.
+
+# COMMAND ----------
+
+from mlflow import MlflowClient
+
+MODEL_NAME = "workspace.fraud.fraud_detector"
+mlflow.set_registry_uri("databricks-uc")
+
+registered = mlflow.register_model(xgb_model_info.model_uri, MODEL_NAME)
+
+client = MlflowClient()
+client.set_registered_model_alias(MODEL_NAME, "champion", registered.version)
+client.set_model_version_tag(MODEL_NAME, registered.version, "threshold", str(THRESHOLD))
+client.set_model_version_tag(MODEL_NAME, registered.version, "test_recall", f"{xgb_result['recall']:.3f}")
+client.set_model_version_tag(MODEL_NAME, registered.version, "test_precision", f"{xgb_result['precision']:.3f}")
+
+print(f"Registered {MODEL_NAME} version {registered.version} with alias 'champion' (threshold {THRESHOLD})")
