@@ -1,0 +1,80 @@
+# Continuous deployment of the champion model to SageMaker:
+#   tests -> staging endpoint + smoke test -> manual approval -> production endpoint + smoke test
+# Run it from the Actions tab ("Deploy model" -> "Run workflow").
+# AWS access uses GitHub OIDC: no AWS keys are stored in GitHub.
+name: Deploy model
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # lets the job request a short-lived AWS token
+  contents: read
+
+concurrency:
+  group: deploy-model
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-2
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  staging:
+    name: Deploy to staging and smoke test
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    defaults:
+      run:
+        working-directory: deploy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "sagemaker>=2.230,<3" boto3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy staging endpoint
+        run: >
+          python deploy_endpoint.py --replace
+          --bucket "${{ vars.S3_BUCKET }}"
+          --role "${{ vars.SAGEMAKER_EXECUTION_ROLE_ARN }}"
+          --endpoint-name fraud-detector-staging
+      - name: Smoke test (scores must match Databricks)
+        run: python test_endpoint.py --bucket "${{ vars.S3_BUCKET }}" --endpoint-name fraud-detector-staging
+
+  production:
+    name: Promote to production (needs approval)
+    needs: staging
+    runs-on: ubuntu-latest
+    environment: production # a required reviewer must approve before this job starts
+    defaults:
+      run:
+        working-directory: deploy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "sagemaker>=2.230,<3" boto3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy production endpoint
+        run: >
+          python deploy_endpoint.py --replace
+          --bucket "${{ vars.S3_BUCKET }}"
+          --role "${{ vars.SAGEMAKER_EXECUTION_ROLE_ARN }}"
+          --endpoint-name fraud-detector
+      - name: Smoke test production
+        run: python test_endpoint.py --bucket "${{ vars.S3_BUCKET }}" --endpoint-name fraud-detector
+      - name: Remove the staging endpoint
+        if: always()
+        run: python delete_endpoint.py --endpoint-name fraud-detector-staging
