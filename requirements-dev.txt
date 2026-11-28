@@ -3,3 +3,4 @@ pytest>=8
 xgboost>=3.0
 pandas>=2
 numpy>=1.26
+boto3>=1.34
