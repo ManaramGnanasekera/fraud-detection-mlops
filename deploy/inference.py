@@ -16,6 +16,9 @@ gold-table row (the raw features, before model preparation), for example:
      "hour_of_day": 2, "is_night": 1, "customer_age": 34, "distance_km": 60.2,
      "city_population": 15000, "category": "shopping_net"}
 
+Each prediction carries the fraud score, the alert flag and the top_reasons: the inputs that pushed the
+score furthest towards fraud, from XGBoost's own SHAP values.
+
 The preparation in prepare_features() must stay identical to prep() in notebooks/03_train_models.py;
 tests/test_inference.py checks that it does.
 """
@@ -93,13 +96,32 @@ def input_fn(request_body, content_type="application/json"):
     return data
 
 
+TOP_REASONS = 3
+
+
+def top_reasons(contributions, values, feature_names, k=TOP_REASONS):
+    """The k inputs that pushed this score furthest towards fraud (largest positive SHAP values)."""
+    order = np.argsort(contributions)[::-1]
+    return [
+        {
+            "feature": feature_names[i],
+            "value": None if math.isnan(values[i]) else round(float(values[i]), 4),
+            "contribution": round(float(contributions[i]), 4),
+        }
+        for i in order[:k]
+        if contributions[i] > 0
+    ]
+
+
 def predict_fn(records, model):
     metadata = model["metadata"]
     feature_names = metadata["feature_names"]
     threshold = float(metadata["threshold"])
 
     matrix = np.array([prepare_features(r, feature_names) for r in records], dtype=float)
-    scores = model["booster"].predict(xgb.DMatrix(matrix, feature_names=feature_names))
+    dmatrix = xgb.DMatrix(matrix, feature_names=feature_names)
+    scores = model["booster"].predict(dmatrix)
+    contribs = model["booster"].predict(dmatrix, pred_contribs=True)[:, :-1]  # last column is the bias
 
     return [
         {
@@ -108,8 +130,9 @@ def predict_fn(records, model):
             "flagged": bool(s >= threshold),
             "threshold": threshold,
             "model_version": metadata.get("model_version"),
+            "top_reasons": top_reasons(c, row, feature_names),
         }
-        for r, s in zip(records, scores)
+        for r, s, c, row in zip(records, scores, contribs, matrix)
     ]
 
 

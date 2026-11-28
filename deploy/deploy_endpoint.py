@@ -9,6 +9,8 @@ It expects xgboost-model.json and model_metadata.json under s3://<bucket>/<prefi
 notebook 04). It packages them as model.tar.gz, then creates a serverless endpoint running
 inference.py in the SageMaker XGBoost 3.0-5 container. A serverless endpoint costs nothing while
 idle; delete it with delete_endpoint.py when finished.
+
+With --replace, an existing endpoint of the same name is deleted first (used by the CD pipeline).
 """
 
 import argparse
@@ -20,6 +22,8 @@ import boto3
 import sagemaker
 from sagemaker.serverless import ServerlessInferenceConfig
 from sagemaker.xgboost import XGBoostModel
+
+from delete_endpoint import delete_endpoint_resources, endpoint_exists
 
 MODEL_FILES = ["xgboost-model.json", "model_metadata.json"]
 
@@ -33,6 +37,7 @@ def parse_args():
     p.add_argument("--region", default="ap-southeast-2")
     p.add_argument("--memory-mb", type=int, default=2048, help="Serverless memory: 1024 to 6144, in steps of 1024")
     p.add_argument("--max-concurrency", type=int, default=2)
+    p.add_argument("--replace", action="store_true", help="Delete an existing endpoint of the same name first")
     return p.parse_args()
 
 
@@ -54,6 +59,14 @@ def main():
     args = parse_args()
     boto_session = boto3.Session(region_name=args.region)
     session = sagemaker.Session(boto_session=boto_session, default_bucket=args.bucket)
+
+    sm = boto_session.client("sagemaker")
+    if endpoint_exists(sm, args.endpoint_name):
+        if not args.replace:
+            raise SystemExit(f"Endpoint '{args.endpoint_name}' already exists. Re-run with --replace, "
+                             "or delete it with delete_endpoint.py.")
+        print(f"Replacing existing endpoint '{args.endpoint_name}'...")
+        delete_endpoint_resources(sm, args.endpoint_name)
 
     model_data = package_model(boto_session.client("s3"), args.bucket, args.prefix)
     print("Packaged model:", model_data)
