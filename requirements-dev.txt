@@ -1,2 +1,5 @@
 pyspark==4.0.1
 pytest>=8
+xgboost>=3.0
+pandas>=2
+numpy>=1.26
